@@ -32,8 +32,7 @@ def post_msg():
         return jsonify({"ok": False}), 400
     c = db()
     cur = c.execute("INSERT INTO msgs (room,nick,color,text,ts) VALUES (?,?,?,?,?)", (room, nick, color, text, time.time()))
-    c.execute("DELETE FROM msgs WHERE room=? AND id NOT IN (SELECT id FROM msgs WHERE room=? ORDER BY id DESC LIMIT 500)", (room, room))
-    c.commit()
+        c.commit()
     mid = cur.lastrowid
     c.close()
     return jsonify({"ok": True, "id": mid})
