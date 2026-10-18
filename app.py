@@ -9,6 +9,7 @@ DB = os.path.join(os.path.dirname(__file__), "chat.db")
 def db():
     c = sqlite3.connect(DB)
     c.execute("CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, nick TEXT, color TEXT, text TEXT, ts REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS online (nick TEXT PRIMARY KEY, color TEXT, room TEXT, ts REAL)")
     return c
 
 @app.route("/api/messages")
@@ -43,6 +44,27 @@ def rooms():
     rows = c.execute("SELECT room, COUNT(*) FROM msgs GROUP BY room").fetchall()
     c.close()
     return jsonify({r[0]: r[1] for r in rows})
+
+@app.route("/api/ping", methods=["POST"])
+def ping():
+    d = request.get_json(force=True)
+    nick = (d.get("nick") or "Гость")[:20]
+    color = (d.get("color") or "#4CAF50")[:10]
+    room = (d.get("room") or "general")[:30]
+    c = db()
+    c.execute("INSERT OR REPLACE INTO online (nick,color,room,ts) VALUES (?,?,?,?)", (nick, color, room, time.time()))
+    c.execute("DELETE FROM online WHERE ts < ?", (time.time()-120,))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/online")
+def online():
+    room = request.args.get("room", "general")
+    c = db()
+    rows = c.execute("SELECT nick,color FROM online WHERE room=? AND ts > ? ORDER BY nick", (room, time.time()-120)).fetchall()
+    c.close()
+    return jsonify([{"nick": r[0], "color": r[1]} for r in rows])
 
 @app.route("/")
 def index():
