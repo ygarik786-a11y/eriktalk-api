@@ -31,7 +31,7 @@ def post_msg():
     if not text:
         return jsonify({"ok": False}), 400
     c = db()
-    cur = c.execute("INSERT INTO msgs (room,nick,color,text,ts) VALUES (?,?,?,?,?)", (room, nick, color, text, time.time()))
+cur = c.execute("INSERT INTO msgs (room,nick,color,text,ts) VALUES (?,?,?,?,?)", (room, nick, color, text, time.time()))
         c.commit()
     mid = cur.lastrowid
     c.close()
