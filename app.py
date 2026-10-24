@@ -14,7 +14,30 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS birthdays (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, day INTEGER, month INTEGER, year INTEGER, status TEXT DEFAULT 'pending', public INTEGER DEFAULT 0, created_at REAL)")
     c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, expires REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS bans (nick TEXT PRIMARY KEY, ts REAL)")
+    for tbl in ("msgs", "online"):
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN admin INTEGER DEFAULT 0")
+        except Exception:
+            pass
     return c
+
+
+def _is_banned(c, nick):
+    # Сравнение в Python: SQLite LOWER() не умеет кириллицу
+    target = (nick or "").strip().lower()
+    rows = c.execute("SELECT nick FROM bans").fetchall()
+    return any((r[0] or "").strip().lower() == target for r in rows)
+
+
+def _pin_ok(c, pin):
+    if not pin:
+        return False
+    stored = _get_config(c, "chat_pin")
+    if not stored or ":" not in stored:
+        return False
+    salt, h = stored.split(":", 1)
+    return secrets.compare_digest(_hash_pw(str(pin), salt), h)
 
 
 # ---------- ErikTalk chat ----------
@@ -24,10 +47,10 @@ def get_msgs():
     room = request.args.get("room", "general")
     after = int(request.args.get("after", 0))
     c = db()
-    rows = c.execute("SELECT id,nick,color,text,ts FROM msgs WHERE room=? AND id>? ORDER BY id DESC LIMIT 50", (room, after)).fetchall()
+    rows = c.execute("SELECT id,nick,color,text,ts,admin FROM msgs WHERE room=? AND id>? ORDER BY id DESC LIMIT 50", (room, after)).fetchall()
     c.close()
     rows.reverse()
-    return jsonify([{"id": r[0], "nick": r[1], "color": r[2], "text": r[3], "ts": r[4]} for r in rows])
+    return jsonify([{"id": r[0], "nick": r[1], "color": r[2], "text": r[3], "ts": r[4], "admin": r[5] or 0} for r in rows])
 
 
 @app.route("/api/messages", methods=["POST"])
@@ -40,7 +63,11 @@ def post_msg():
     if not text:
         return jsonify({"ok": False}), 400
     c = db()
-    cur = c.execute("INSERT INTO msgs (room,nick,color,text,ts) VALUES (?,?,?,?,?)", (room, nick, color, text, time.time()))
+    if _is_banned(c, nick):
+        c.close()
+        return jsonify({"ok": False, "error": "banned"}), 403
+    is_admin = 1 if _pin_ok(c, d.get("pin")) else 0
+    cur = c.execute("INSERT INTO msgs (room,nick,color,text,ts,admin) VALUES (?,?,?,?,?,?)", (room, nick, color, text, time.time(), is_admin))
     # keep last 500 per room
     c.execute("DELETE FROM msgs WHERE room=? AND id NOT IN (SELECT id FROM msgs WHERE room=? ORDER BY id DESC LIMIT 500)", (room, room))
     c.commit()
@@ -64,9 +91,13 @@ def ping():
     color = (d.get("color") or "#4CAF50")[:10]
     room = (d.get("room") or "general")[:30]
     c = db()
-    c.execute("INSERT INTO online (nick,color,room,ts) VALUES (?,?,?,?) "
-              "ON CONFLICT(nick,room) DO UPDATE SET color=excluded.color, ts=excluded.ts",
-              (nick, color, room, time.time()))
+    if _is_banned(c, nick):
+        c.close()
+        return jsonify({"ok": False, "error": "banned"}), 403
+    is_admin = 1 if _pin_ok(c, d.get("pin")) else 0
+    c.execute("INSERT INTO online (nick,color,room,ts,admin) VALUES (?,?,?,?,?) "
+              "ON CONFLICT(nick,room) DO UPDATE SET color=excluded.color, ts=excluded.ts, admin=excluded.admin",
+              (nick, color, room, time.time(), is_admin))
     c.execute("DELETE FROM online WHERE ts < ?", (time.time() - 300,))
     c.commit()
     c.close()
@@ -77,10 +108,10 @@ def ping():
 def online():
     room = request.args.get("room", "general")
     c = db()
-    rows = c.execute("SELECT nick,color FROM online WHERE room=? AND ts>? ORDER BY nick",
+    rows = c.execute("SELECT nick,color,admin FROM online WHERE room=? AND ts>? ORDER BY nick",
                      (room, time.time() - 90)).fetchall()
     c.close()
-    return jsonify([{"nick": r[0], "color": r[1]} for r in rows])
+    return jsonify([{"nick": r[0], "color": r[1], "admin": r[2] or 0} for r in rows])
 
 
 # ---------- Birthdays ----------
@@ -282,6 +313,100 @@ def admin_announcement():
     c = db()
     c.execute("INSERT INTO config (key,value) VALUES ('announcement',?) "
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (text,))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True})
+
+
+# ---------- Admin: управление чатом ErikTalk ----------
+
+@app.route("/api/admin/chat/overview")
+def admin_chat_overview():
+    if not _is_admin():
+        return jsonify({"ok": False}), 401
+    c = db()
+    rows = c.execute("SELECT nick,color,room,admin FROM online WHERE ts>? ORDER BY room,nick",
+                     (time.time() - 120,)).fetchall()
+    bans = [r[0] for r in c.execute("SELECT nick FROM bans ORDER BY nick").fetchall()]
+    pin_set = _get_config(c, "chat_pin") is not None
+    c.close()
+    return jsonify({"online": [{"nick": r[0], "color": r[1], "room": r[2], "admin": r[3] or 0} for r in rows],
+                    "bans": bans, "pin_set": pin_set})
+
+
+@app.route("/api/admin/chat/ban", methods=["POST"])
+def admin_chat_ban():
+    if not _is_admin():
+        return jsonify({"ok": False}), 401
+    d = request.get_json(force=True) or {}
+    nick = str(d.get("nick") or "").strip()[:20]
+    if not nick:
+        return jsonify({"ok": False, "error": "no nick"}), 400
+    c = db()
+    c.execute("INSERT INTO bans (nick,ts) VALUES (?,?) ON CONFLICT(nick) DO UPDATE SET ts=excluded.ts",
+              (nick, time.time()))
+    for (onick, oroom) in c.execute("SELECT nick,room FROM online").fetchall():
+        if (onick or "").strip().lower() == nick.strip().lower():
+            c.execute("DELETE FROM online WHERE nick=? AND room=?", (onick, oroom))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/chat/unban", methods=["POST"])
+def admin_chat_unban():
+    if not _is_admin():
+        return jsonify({"ok": False}), 401
+    d = request.get_json(force=True) or {}
+    nick = str(d.get("nick") or "").strip()[:20]
+    c = db()
+    for (bnick,) in c.execute("SELECT nick FROM bans").fetchall():
+        if (bnick or "").strip().lower() == nick.strip().lower():
+            c.execute("DELETE FROM bans WHERE nick=?", (bnick,))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/chat/pin", methods=["POST"])
+def admin_chat_pin():
+    if not _is_admin():
+        return jsonify({"ok": False}), 401
+    d = request.get_json(force=True) or {}
+    pin = str(d.get("pin") or "")
+    if len(pin) < 4:
+        return jsonify({"ok": False, "error": "pin too short"}), 400
+    salt = secrets.token_hex(8)
+    c = db()
+    c.execute("INSERT INTO config (key,value) VALUES ('chat_pin',?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              (salt + ":" + _hash_pw(pin, salt),))
+    c.commit()
+    c.close()
+    return jsonify({"ok": True})
+
+
+# ---------- Цвет часов (Отсчёты + главная) ----------
+
+@app.route("/api/clock-color")
+def clock_color():
+    c = db()
+    color = _get_config(c, "clock_color") or ""
+    c.close()
+    return jsonify({"color": color})
+
+
+@app.route("/api/admin/clock-color", methods=["POST"])
+def admin_clock_color():
+    if not _is_admin():
+        return jsonify({"ok": False}), 401
+    d = request.get_json(force=True) or {}
+    color = str(d.get("color") or "").strip()
+    if color and not (len(color) == 7 and color[0] == "#" and all(ch in "0123456789abcdefABCDEF" for ch in color[1:])):
+        return jsonify({"ok": False, "error": "bad color"}), 400
+    c = db()
+    c.execute("INSERT INTO config (key,value) VALUES ('clock_color',?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (color,))
     c.commit()
     c.close()
     return jsonify({"ok": True})
